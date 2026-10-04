@@ -254,43 +254,64 @@ def compute_corner_descriptors(img):
     return sift_keypoints
 
 def match_descriptors(img1_keypoints, img2_keypoints):
-    # Get descriptors from keypoints
+
     descriptors_A = np.array([
-        keypoint["descriptor"] for keypoint in img1_keypoints
-    ])
+        keypoint["descriptor"]
+        for keypoint in img1_keypoints
+    ], dtype=np.float32)
 
     descriptors_B = np.array([
-        keypoint["descriptor"] for keypoint in img2_keypoints
-    ])
+        keypoint["descriptor"]
+        for keypoint in img2_keypoints
+    ], dtype=np.float32)
 
-    # Compute euclidean distance between each pair of descriptors A and B
-    diff = (
-        descriptors_A[:, np.newaxis, :]
-        - descriptors_B[np.newaxis, :, :]
+    # Squared Euclidean distances
+    A_squared = np.sum(descriptors_A ** 2, axis=1, keepdims=True)
+    B_squared = np.sum(descriptors_B ** 2, axis=1, keepdims=True).T
+
+    distances_squared = (
+        A_squared
+        + B_squared
+        - 2 * descriptors_A @ descriptors_B.T
     )
-    distances = np.linalg.norm(diff, axis=2)
 
-    # Get sorted list of distances indices
-    nearest_indices = np.argsort(distances, axis=1)[:, :2]
+    # Numerische Rundungsfehler verhindern
+    distances_squared = np.maximum(distances_squared, 0)
 
-    # Get indices from both descriptors
-    best_indices = nearest_indices[:, 0]
-    second_indices = nearest_indices[:, 1]
+    # Zwei kleinste Distanzen finden
+    nearest_indices = np.argpartition(
+        distances_squared,
+        kth=1,
+        axis=1
+    )[:, :2]
 
-    best_distances = distances[
-        np.arange(len(distances)),
-        best_indices
-    ]
+    # Die beiden gefundenen Kandidaten nach Distanz sortieren
+    row_indices = np.arange(len(descriptors_A))
 
-    second_distances = distances[
-        np.arange(len(distances)),
-        second_indices
-    ]
+    first = nearest_indices[:, 0]
+    second = nearest_indices[:, 1]
 
-    # Lowe Ratio
+    swap = (
+        distances_squared[row_indices, second]
+        < distances_squared[row_indices, first]
+    )
+
+    best_indices = first.copy()
+    second_indices = second.copy()
+
+    best_indices[swap] = second[swap]
+    second_indices[swap] = first[swap]
+
+    best_distances = np.sqrt(
+        distances_squared[row_indices, best_indices]
+    )
+
+    second_distances = np.sqrt(
+        distances_squared[row_indices, second_indices]
+    )
+
+    # Lowe Ratio Test
     ratios = best_distances / (second_distances + 1e-12)
-
-    # Get only strong matches
     good_matches = ratios < MATCHING_THRESHOLD
 
     matches = []
@@ -406,8 +427,8 @@ def main():
     # PROCESSING
     # --------------------------------------------------------------------------------
 
-    zimmer1_img = cv2.imread(r'..\Images\Zimmer1.jpg', cv2.IMREAD_GRAYSCALE)
-    zimmer2_img = cv2.imread(r'..\Images\Zimmer2.jpg', cv2.IMREAD_GRAYSCALE)
+    zimmer1_img = cv2.imread(r'..\Images\Schrank1.jpg', cv2.IMREAD_GRAYSCALE)
+    zimmer2_img = cv2.imread(r'..\Images\Schrank2.jpg', cv2.IMREAD_GRAYSCALE)
 
     new_width = 1080
     new_height = 1440
@@ -425,9 +446,9 @@ def main():
     # 1. Compute descriptors
     z1_keypoints = compute_corner_descriptors(z1_copy)
     z2_keypoints = compute_corner_descriptors(z2_copy)
+    
     # 2. Match descriptors
     matches = match_descriptors(z1_keypoints, z2_keypoints)
-
     # --------------------------------------------------------------------------------
     # Visualize
     # --------------------------------------------------------------------------------
