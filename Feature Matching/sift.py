@@ -9,7 +9,7 @@ PATCH_SIZE = 16
 SUBPATCH_SIZE = 4
 SIGMA_WEIGHT = 8
 MATCHING_THRESHOLD = 0.75
-
+EDGE_RATIO = 10
 
 # --------------------------------------------------------------------------------
 # HARRIS DETECTOR
@@ -59,9 +59,146 @@ def find_corner_coordinates(img):
 
     return x, y
 
+# Compute points of interest and their descriptors
+def harris_corner_descriptors(img):
+
+    # Get normalized img for values ranged 0-255
+    norm_img = img.astype(np.float32) / 255.0
+
+    # Compute gradient of image in both direction
+    Ix, Iy = get_gradients(norm_img)
+
+    # Get matrix for later cornerness function
+    Ix2 = Ix * Ix
+    IxIy = Ix * Iy
+    Iy2 = Iy * Iy
+
+    # Gaussian Filtering
+    Sxx = cv2.GaussianBlur(Ix2, (5, 5), 0)
+    Syy = cv2.GaussianBlur(Iy2, (5, 5), 0)
+    Sxy = cv2.GaussianBlur(IxIy, (5, 5), 0)
+
+    # Get corner responses
+    corners_img = cornerness_function(Sxx, Syy, Sxy)
+    # Get only local maxima
+    responses_img = non_maximum_suppression(corners_img)
+
+    # Harris responses
+    y, x = np.where(responses_img)
+    
+    magnitude, orientation = cv2.cartToPolar(Ix, Iy, angleInDegrees=True)
+    sift_keypoints = harris_assign_orientation(zip(x, y), norm_img, magnitude, orientation)
+
+    sift_keypoints = harris_compute_descriptors(sift_keypoints, magnitude, orientation)
+
+    return sift_keypoints
+
+def harris_assign_orientation(keypoints, norm_img, magnitude, orientation):    
+    sift_keypoints = []
+    for (x, y) in keypoints:
+        bins = np.zeros(36)
+        dominant_orientation = []
+        sigma = 1
+        radius = int(3 * sigma)
+
+        # Compute histogram of gradient for current keypoint
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                x2 = x + dx
+                y2 = y + dy
+
+                if x2 < 0 or x2 >= norm_img.shape[1] or y2 < 0 or y2 >= norm_img.shape[0]:
+                    continue
+
+                # Add value to bin
+                angle = orientation[y2, x2] % 360.0
+                bin_index = int(angle / 10.0)
+                weight = np.exp(
+                    -(dx**2 + dy**2) / (2 * sigma**2)
+                )
+                bins[bin_index] += weight * magnitude[y2, x2]
+
+        # Determine dominant orientation(s) - get all dominant orientations above 80% of max bin value
+        threshold = 0.8 * bins.max()
+        dominant_orientation = np.where(bins > threshold)[0] * 10
+
+        # For multiple dominant orientations, create multiple keypoints
+        for keypoint_orientation in dominant_orientation:
+            keypoint = {
+                "x": x,
+                "y": y,
+                "scale": 1,
+                "orientation": keypoint_orientation,
+                "descriptor": None
+            }
+            sift_keypoints.append(keypoint)
+
+    return sift_keypoints
+
+def harris_compute_descriptors(sift_keypoints, magnitude, orientation):
+    valid_descriptors = []
+    for keypoint in sift_keypoints:
+        # Getting some values
+        center_x = keypoint["x"]
+        center_y = keypoint["y"]
+        scale = keypoint["scale"]
+        patch_size = 16
+        half_size = patch_size // 2
+        subpatch_size = 4
+        height, width = magnitude.shape
+
+        # Ignore coordinates outside of the image
+        if center_x - half_size < 0 or center_x + half_size > width or center_y - half_size < 0 or center_y + half_size > height:
+            continue
+
+        keypoint_orientation = keypoint["orientation"]
+
+        descriptor = []
+        # Compute for the patchsize for each subpatch the hog
+        for cell_y in range(4):
+            for cell_x in range(4):
+
+                histogram = np.zeros(8)
+
+                for dy in range(subpatch_size):
+                    for dx in range(subpatch_size):
+
+                        yy = center_y - half_size + cell_y * subpatch_size + dy
+                        xx = center_x - half_size + cell_x * subpatch_size + dx
+
+                        magnitude_val = magnitude[yy, xx]
+                        weight = np.exp(
+                            -((center_x-xx)**2 + (center_y-yy)**2) / (2 * SIGMA_WEIGHT**2)
+                        )
+                        angle = orientation[yy, xx]
+
+                        # Normalize orientation
+                        angle = (angle - keypoint_orientation) % 360
+                        bin_index = int(angle / 45)
+
+                        histogram[bin_index] += weight * magnitude_val
+
+                descriptor.extend(histogram)
+
+        # Normalize descriptor
+        descriptor = np.array(descriptor)
+        norm = np.linalg.norm(descriptor)
+        if norm > 0:
+            descriptor = descriptor / norm
+
+        # Store descriptor
+        keypoint["descriptor"] = descriptor
+        valid_descriptors.append(keypoint)
+
+    return valid_descriptors
+
 def apply_corners(img, corners_x, corners_y):
     for x_i, y_i in zip(corners_x, corners_y):
         cv2.circle(img, (x_i, y_i), 5, 255, -1)
+
+# --------------------------------------------------------------------------
+# DIFFERENCE OF GAUSSIANS SIFT
+# --------------------------------------------------------------------------
 
 def get_dogs(img):
     img = img.astype(np.float32) / 255.0
@@ -88,7 +225,28 @@ def get_dogs(img):
 
     return scale_space, dog_space
 
-def find_scale_space_extrema(dog_space, threshold=THRESHOLD_RATIO):
+def is_edge_like(img, x, y, edge_ratio=EDGE_RATIO):
+    Ix, Iy = get_gradients(img)
+
+    window_Ix = Ix[y-1:y+2, x-1:x+2]
+    window_Iy = Iy[y-1:y+2, x-1:x+2]
+
+    Sxx = np.sum(window_Ix ** 2)
+    Syy = np.sum(window_Iy ** 2)
+    Sxy = np.sum(window_Ix * window_Iy)
+
+    trace = Sxx + Syy
+    determinant = Sxx * Syy - Sxy ** 2
+
+    if determinant <= 0:
+        return True
+
+    ratio = (trace ** 2) / determinant
+    threshold = ((edge_ratio + 1) ** 2) / edge_ratio
+
+    return ratio > threshold
+
+def find_scale_space_extrema(scale_space, dog_space, threshold=THRESHOLD_RATIO):
     keypoints = []
 
     for s in range(1, len(dog_space) - 1):
@@ -130,6 +288,10 @@ def find_scale_space_extrema(dog_space, threshold=THRESHOLD_RATIO):
 
                 # Check extremum
                 if value > neighbors.max() or value < neighbors.min():
+
+                    if is_edge_like(scale_space[s], x, y):
+                        continue
+
                     keypoints.append((x, y, s, value))
 
     return keypoints
@@ -184,49 +346,69 @@ def assign_orientation(keypoints, scale_space, magnitudes, orientations):
 def compute_descriptors(sift_keypoints, magnitudes, orientations):
     valid_descriptors = []
     for keypoint in sift_keypoints:
+        # Getting some values
         center_x = keypoint["x"]
         center_y = keypoint["y"]
-        half_size = int(PATCH_SIZE / 2)
+        scale = keypoint["scale"]
+        patch_size = int(DOGS_SCALES[scale] * 6)
+        half_size = int(patch_size / 2)
+        subpatch_size = int(DOGS_SCALES[scale] * 1.5)
         height, width = magnitudes[0].shape
-        
+
+        # Ignore coordinates outside of the image
         if center_x - half_size < 0 or center_x + half_size > width or center_y - half_size < 0 or center_y + half_size > height:
             continue
 
-        scale = keypoint["scale"]
         keypoint_orientation = keypoint["orientation"]
 
         descriptor = []
+        # Compute for the patchsize for each subpatch the hog
+        theta = np.deg2rad(keypoint_orientation)
+
+        cos_theta = np.cos(theta)
+        sin_theta = np.sin(theta)
 
         for cell_y in range(4):
             for cell_x in range(4):
-
                 histogram = np.zeros(8)
 
-                for dy in range(SUBPATCH_SIZE):
-                    for dx in range(SUBPATCH_SIZE):
+                for dy in range(subpatch_size):
+                    for dx in range(subpatch_size):
 
-                        yy = center_y - half_size + cell_y * SUBPATCH_SIZE + dy
-                        xx = center_x - half_size + cell_x * SUBPATCH_SIZE + dx
+                        # Position relative to the middle point of the hog
+                        rel_x = -half_size + cell_x * subpatch_size + dx
+                        rel_y = -half_size + cell_y * subpatch_size + dy
+
+                        # Get orientated patch cell
+                        rotated_x = cos_theta * rel_x - sin_theta * rel_y
+                        rotated_y = sin_theta * rel_x + cos_theta * rel_y
+
+                        xx = int(round(center_x + rotated_x))
+                        yy = int(round(center_y + rotated_y))
+
+                        if not (0 <= xx < width and 0 <= yy < height):
+                            continue
 
                         magnitude = magnitudes[scale][yy, xx]
-                        weight = np.exp(
-                            -((center_x-xx)**2 + (center_y-yy)**2) / (2 * SIGMA_WEIGHT**2)
-                        )
-                        angle = orientations[scale][yy, xx]
+                        angle = (orientations[scale][yy, xx] - keypoint_orientation) % 360
+                        bin_index = min(int(angle / 45), 7)
 
-                        # Normalize orientation
-                        angle = (angle - keypoint_orientation) % 360
-                        bin_index = int(angle / 45)
+                        weight = np.exp(
+                            -(rotated_x**2 + rotated_y**2)
+                            / (2 * SIGMA_WEIGHT**2)
+                        )
 
                         histogram[bin_index] += weight * magnitude
 
                 descriptor.extend(histogram)
 
+        # Normalize descriptor
         descriptor = np.array(descriptor)
         norm = np.linalg.norm(descriptor)
         if norm > 0:
             descriptor = descriptor / norm
 
+        # Store descriptor
         keypoint["descriptor"] = descriptor
         valid_descriptors.append(keypoint)
 
@@ -235,7 +417,7 @@ def compute_descriptors(sift_keypoints, magnitudes, orientations):
 def compute_corner_descriptors(img):
     # 1. Compute relevant keypoints
     scale_space, dogs = get_dogs(img)
-    keypoints = find_scale_space_extrema(dogs)
+    keypoints = find_scale_space_extrema(scale_space, dogs)
 
     # 2. Compute orientation
     # Compute magnitudes and gradients for each scale space
@@ -332,6 +514,8 @@ def match_descriptors(img1_keypoints, img2_keypoints):
 
     return matches
 
+# -------------------------------------------------------------------------
+
 def visualize_matches(img_A, img_B, keypoints_A, keypoints_B, matches):
 
     # Convert pictures to BGR to make colored points
@@ -427,11 +611,11 @@ def main():
     # PROCESSING
     # --------------------------------------------------------------------------------
 
-    zimmer1_img = cv2.imread(r'..\Images\Schrank1.jpg', cv2.IMREAD_GRAYSCALE)
-    zimmer2_img = cv2.imread(r'..\Images\Schrank2.jpg', cv2.IMREAD_GRAYSCALE)
+    zimmer1_img = cv2.imread(r'..\Images\Stuhl1.jpg', cv2.IMREAD_GRAYSCALE)
+    zimmer2_img = cv2.imread(r'..\Images\Stuhl2.jpg', cv2.IMREAD_GRAYSCALE)
 
-    new_width = 1080
-    new_height = 1440
+    new_width = 540
+    new_height = 720
     
     # Resize the image
     zimmer1_resized = cv2.resize(zimmer1_img, (new_width, new_height))
@@ -443,26 +627,30 @@ def main():
     # SIFT
     # --------------------------------------------------------------------------------
 
-    # 1. Compute descriptors
+    # # 1. Compute descriptors
     z1_keypoints = compute_corner_descriptors(z1_copy)
     z2_keypoints = compute_corner_descriptors(z2_copy)
     
     # 2. Match descriptors
     matches = match_descriptors(z1_keypoints, z2_keypoints)
+
+    
     # --------------------------------------------------------------------------------
     # Visualize
     # --------------------------------------------------------------------------------
 
+    # Visualize corners
     # window = "Visualisierung"
     # cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     # cv2.setWindowProperty(window, cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
     # cv2.resizeWindow(window, 480, 640)
 
-    # cv2.imshow(window, zimmer1_resized)
+    # cv2.imshow(window, z1_copy)
 
     # cv2.waitKey(0)
     # cv2.destroyAllWindows()
 
+    # Visualize matches
     visualization = visualize_matches(
         zimmer1_resized,
         zimmer2_resized,
