@@ -457,17 +457,14 @@ def match_descriptors(img1_keypoints, img2_keypoints):
         - 2 * descriptors_A @ descriptors_B.T
     )
 
-    # Numerische Rundungsfehler verhindern
     distances_squared = np.maximum(distances_squared, 0)
 
-    # Zwei kleinste Distanzen finden
     nearest_indices = np.argpartition(
         distances_squared,
         kth=1,
         axis=1
     )[:, :2]
 
-    # Die beiden gefundenen Kandidaten nach Distanz sortieren
     row_indices = np.arange(len(descriptors_A))
 
     first = nearest_indices[:, 0]
@@ -627,7 +624,7 @@ def main():
     # SIFT
     # --------------------------------------------------------------------------------
 
-    # # 1. Compute descriptors
+    # 1. Compute descriptors
     z1_keypoints = compute_corner_descriptors(z1_copy)
     z2_keypoints = compute_corner_descriptors(z2_copy)
     
