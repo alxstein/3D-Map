@@ -3,6 +3,7 @@ import numpy as np
 from sift import compute_corner_descriptors, match_descriptors
 
 RANSAC_ITERATIONS = 1000
+RANSAC_THRESHOLD = 4.0
 
 def ransac(images):
     # Assumes images are already preprocessed
@@ -40,13 +41,14 @@ def ransac(images):
 
 def ransac_matching(keypoints_A, keypoints_B, matches):
 
-    # Get coordinates of the keypoints
+    # Get coordinates of the keypoints that match in both images: points A and B have same length, points_A[i] is the point that was matched to points_B[i]
     points_A, points_B = extract_coordinates(keypoints_A, keypoints_B, matches)
 
     best_F = None
-    best_inliers = []
+    best_inlier_indices = np.array([], dtype=int)
+    best_inlier_count = 0
 
-    for i in range(RANSAC_ITERATIONS):
+    for _ in range(RANSAC_ITERATIONS):
         # Randomly select 8 matches
         samples_A, samples_B = random_8_matches(points_A, points_B)
 
@@ -56,6 +58,25 @@ def ransac_matching(keypoints_A, keypoints_B, matches):
         if F is None:
             continue
 
+        # Measure how good the model fits all matched points
+        errors = compute_sampson_errors(F, points_A, points_B)
+
+        # Classify matches as inliers using the threshold
+        inlier_mask = errors < RANSAC_THRESHOLD
+        inlier_indices = np.flatnonzero(inlier_mask)
+        inlier_count = len(inlier_indices)
+
+        if inlier_count > best_inlier_count:
+            best_F = F
+            best_inlier_indices = inlier_indices
+            best_inlier_count = inlier_count
+
+    if best_F is None or best_inlier_count < 8:
+        return None, []
+
+    # Return the exact keypoints from the best indices
+    best_inliers = [matches[index] for index in best_inlier_indices]
+    
     return best_F, best_inliers
 
 def extract_coordinates(keypoints_A, keypoints_B, matches):
@@ -203,6 +224,41 @@ def normalize_points(points):
 
     return normalized_points, T
 
+def compute_sampson_errors(F, points_A, points_B):
+    # Convert 2D points to homogeneous coordinates.
+    points_A_h = np.column_stack([
+        points_A,
+        np.ones(len(points_A))
+    ])
+    points_B_h = np.column_stack([
+        points_B,
+        np.ones(len(points_B))
+    ])
+
+    # Compute the epipolar lines in both images.
+    lines_B = (F @ points_A_h.T).T
+    lines_A = (F.T @ points_B_h.T).T
+
+    # Compute the squared algebraic error for each correspondence.
+    residuals = np.sum(points_B_h * lines_B, axis=1)
+    numerator = residuals ** 2
+
+    # Compute the denominator of the Sampson error.
+    denominator = (
+        lines_B[:, 0] ** 2
+        + lines_B[:, 1] ** 2
+        + lines_A[:, 0] ** 2
+        + lines_A[:, 1] ** 2
+    )
+
+    # Avoid division by zero for degenerate configurations.
+    errors = np.full(len(points_A), np.inf)
+    valid = denominator > 1e-12
+
+    errors[valid] = numerator[valid] / denominator[valid]
+
+    return errors
+
 def main():
 
     zimmer1_img = cv2.imread(r'..\Images\Stuhl1.jpg', cv2.IMREAD_GRAYSCALE)
@@ -220,15 +276,6 @@ def main():
     images = [z1_copy, z2_copy]
 
     ransac(images)
-
-    # 1. Get keypoints and matches --------------------------------------------
-    z1_keypoints = compute_corner_descriptors(z1_copy)
-    z2_keypoints = compute_corner_descriptors(z2_copy)
-    
-    matches = match_descriptors(z1_keypoints, z2_keypoints)
-    # -------------------------------------------------------------------------
-
-    # 
 
 if __name__ == "__main__":
     main()
