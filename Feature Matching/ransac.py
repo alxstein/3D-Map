@@ -2,8 +2,170 @@ import cv2
 import numpy as np
 from sift import compute_corner_descriptors, match_descriptors
 
+VIDEO_PATH = r"..\Videos\zimmer_video.mp4"
+OUTPUT_PATH = r"..\Videos\ransac_output.mp4"
+
+NEW_WIDTH = 540
+NEW_HEIGHT = 720
+FRAME_RATE = 20
 RANSAC_ITERATIONS = 1000
 RANSAC_THRESHOLD = 4.0
+
+def process_video(video_path, output_path):
+    # Open the input video.
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video: {video_path}")
+
+    # Read the original video properties.
+    original_fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if original_fps <= 0:
+        cap.release()
+        raise ValueError("Could not determine the original video FPS.")
+
+    if FRAME_RATE <= 0 or FRAME_RATE > original_fps:
+        cap.release()
+        raise ValueError(
+            f"FRAME_RATE must be between 1 and the original FPS ({original_fps:.2f})."
+        )
+
+    print(f"Original FPS: {original_fps:.2f}")
+    print(f"Processing FPS: {FRAME_RATE}")
+    print(f"Original frame count: {total_frames}")
+
+    # Create the output video writer.
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(
+        output_path,
+        fourcc,
+        FRAME_RATE,
+        (NEW_WIDTH * 2, NEW_HEIGHT)
+    )
+
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"Could not create output video: {output_path}")
+
+    # Store the previous processed frame and its keypoints.
+    previous_frame = None
+    previous_keypoints = None
+
+    # Determine which source frames correspond to the target frame rate.
+    frame_interval = original_fps / FRAME_RATE
+    next_target_frame = 0
+    frame_index = 0
+
+    try:
+        while True:
+            success, frame = cap.read()
+
+            if not success:
+                break
+
+            # Select frames at the requested processing rate.
+            if frame_index + 1e-6 < next_target_frame:
+                frame_index += 1
+                continue
+
+            next_target_frame += frame_interval
+            frame_index += 1
+
+            # Resize the selected frame to the required dimensions.
+            frame = cv2.resize(
+                frame,
+                (NEW_WIDTH, NEW_HEIGHT)
+            )
+
+            # Convert the frame to grayscale for feature extraction.
+            gray_frame = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2GRAY
+            )
+
+            # Extract keypoints for the current frame.
+            current_keypoints = compute_corner_descriptors(gray_frame)
+
+            # The first frame has no previous frame to match against.
+            if previous_frame is None:
+                previous_frame = gray_frame
+                previous_keypoints = current_keypoints
+                continue
+
+            # Match descriptors between consecutive processed frames.
+            matches = match_descriptors(
+                previous_keypoints,
+                current_keypoints
+            )
+
+            # Estimate the fundamental matrix and retrieve inliers.
+            F, inliers = ransac_matching(
+                previous_keypoints,
+                current_keypoints,
+                matches
+            )
+
+            print(
+                f"Frame {frame_index}: "
+                f"matches={len(matches)}, inliers={len(inliers)}"
+            )
+
+            # Draw only the inlier correspondences.
+            if inliers:
+                cv_matches = [
+                    cv2.DMatch(
+                        _queryIdx=match["idx_A"],
+                        _trainIdx=match["idx_B"],
+                        _distance=0.0
+                    )
+                    for match in inliers
+                ]
+
+                visualization = cv2.drawMatches(
+                    img1=previous_frame,
+                    keypoints1=[
+                        cv2.KeyPoint(float(kp["x"]), float(kp["y"]), 1)
+                        for kp in previous_keypoints
+                    ],
+                    img2=gray_frame,
+                    keypoints2=[
+                        cv2.KeyPoint(float(kp["x"]), float(kp["y"]), 1)
+                        for kp in current_keypoints
+                    ],
+                    matches1to2=cv_matches,
+                    outImg=None,
+                    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+                )
+            else:
+                # Show both frames side by side if no valid model was found.
+                visualization = cv2.hconcat([
+                    previous_frame,
+                    gray_frame
+                ])
+
+            # Write the visualization to the output video.
+            writer.write(visualization)
+
+            # Display the current visualization in a window.
+            cv2.imshow("RANSAC Video", visualization)
+
+            # Press Q to stop processing early.
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+            # Use the current frame as the next previous frame.
+            previous_frame = gray_frame
+            previous_keypoints = current_keypoints
+
+    finally:
+        # Release resources even if an error occurs.
+        cap.release()
+        writer.release()
+        cv2.destroyAllWindows()
+
+    print(f"Visualization saved to: {output_path}")
 
 def ransac(images):
     # Assumes images are already preprocessed
@@ -28,8 +190,13 @@ def ransac(images):
 
         matches = match_descriptors(keypoints_A, keypoints_B)
 
+        print("Number of matches:", len(matches))
+
         # Apply ransac now
         best_F, best_inliers = ransac_matching(keypoints_A, keypoints_B, matches)
+
+        print("Fundamental matrix found:", best_F is not None)
+        print("Number of inliers:", len(best_inliers))
         
         if best_inliers != []:
             frame_matched_keypoints.append(best_inliers)
@@ -40,6 +207,10 @@ def ransac(images):
     return frame_matched_keypoints
 
 def ransac_matching(keypoints_A, keypoints_B, matches):
+
+    # Stop here if less than 8 matches have been found
+    if len(matches) < 8:
+        return None, []
 
     # Get coordinates of the keypoints that match in both images: points A and B have same length, points_A[i] is the point that was matched to points_B[i]
     points_A, points_B = extract_coordinates(keypoints_A, keypoints_B, matches)
@@ -261,21 +432,26 @@ def compute_sampson_errors(F, points_A, points_B):
 
 def main():
 
-    zimmer1_img = cv2.imread(r'..\Images\Stuhl1.jpg', cv2.IMREAD_GRAYSCALE)
-    zimmer2_img = cv2.imread(r'..\Images\Stuhl2.jpg', cv2.IMREAD_GRAYSCALE)
+    process_video(
+        VIDEO_PATH,
+        OUTPUT_PATH
+    )
 
-    new_width = 540
-    new_height = 720
+    # zimmer1_img = cv2.imread(r'..\Images\Stuhl1.jpg', cv2.IMREAD_GRAYSCALE)
+    # zimmer2_img = cv2.imread(r'..\Images\Stuhl2.jpg', cv2.IMREAD_GRAYSCALE)
+
+    # new_width = 540
+    # new_height = 720
     
-    # Resize the image
-    zimmer1_resized = cv2.resize(zimmer1_img, (new_width, new_height))
-    zimmer2_resized = cv2.resize(zimmer2_img, (new_width, new_height))
-    z1_copy = zimmer1_resized.copy()
-    z2_copy = zimmer2_resized.copy()
+    # # Resize the image
+    # zimmer1_resized = cv2.resize(zimmer1_img, (new_width, new_height))
+    # zimmer2_resized = cv2.resize(zimmer2_img, (new_width, new_height))
+    # z1_copy = zimmer1_resized.copy()
+    # z2_copy = zimmer2_resized.copy()
 
-    images = [z1_copy, z2_copy]
+    # images = [z1_copy, z2_copy]
 
-    ransac(images)
+    # ransac(images)
 
 if __name__ == "__main__":
     main()
