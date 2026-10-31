@@ -1,9 +1,11 @@
 import cv2
 import numpy as np
+import time
+from scipy.ndimage import maximum_filter, minimum_filter
 
 ALPHA = 0.02
 KERNEL_SIZE = 3
-THRESHOLD_RATIO = 0.03
+THRESHOLD_RATIO = 0.01
 DOGS_SCALES = [1, 1.4, 2, 2.8, 4, 5.6]
 PATCH_SIZE = 16
 SUBPATCH_SIZE = 4
@@ -246,53 +248,123 @@ def is_edge_like(img, x, y, edge_ratio=EDGE_RATIO):
 
     return ratio > threshold
 
+def compute_edge_mask(img):
+    # Calculate second-order derivatives
+    dxx = cv2.Sobel(img, cv2.CV_64F, 2, 0, ksize=3)
+    dyy = cv2.Sobel(img, cv2.CV_64F, 0, 2, ksize=3)
+    dxy = cv2.Sobel(img, cv2.CV_64F, 1, 1, ksize=3)
+
+    # Calculate determinant and trace of the Hessian matrix
+    det = dxx * dyy - dxy**2
+    trace = dxx + dyy
+
+    # Calculate edge response
+    edge_response = np.full_like(det, np.inf)
+    valid = det > 0
+
+    edge_response[valid] = trace[valid]**2 / det[valid]
+
+    # Apply edge threshold
+    edge_threshold = ((EDGE_RATIO + 1)**2) / EDGE_RATIO
+
+    return edge_response < edge_threshold
+
 def find_scale_space_extrema(scale_space, dog_space, threshold=THRESHOLD_RATIO):
     keypoints = []
 
     for s in range(1, len(dog_space) - 1):
 
-        dog_prev = dog_space[s - 1]
-        dog_curr = dog_space[s]
-        dog_next = dog_space[s + 1]
+        # dog_prev = dog_space[s - 1]
+        # dog_curr = dog_space[s]
+        # dog_next = dog_space[s + 1]
 
-        height, width = dog_curr.shape
+        # height, width = dog_curr.shape
 
-        for y in range(1, height - 1):
-            for x in range(1, width - 1):
+        # for x in range(1, width - 1):
+        #     for y in range(1, height - 1):
+        #         value = dog_curr[y, x]
 
-                value = dog_curr[y, x]
+        #         # Get only strong responses
+        #         if abs(value) < threshold:
+        #             continue
 
-                # Get only strong responses
-                if abs(value) < threshold:
-                    continue
+        #         # 3x3 neighborhood of previous scale
+        #         neighbors_prev = dog_prev[y-1:y+2, x-1:x+2]
 
-                # 3x3 neighborhood of previous scale
-                neighbors_prev = dog_prev[y-1:y+2, x-1:x+2]
+        #         # 3x3 neighborhood of current scale
+        #         neighbors_curr = dog_curr[y-1:y+2, x-1:x+2]
 
-                # 3x3 neighborhood of current scale
-                neighbors_curr = dog_curr[y-1:y+2, x-1:x+2]
+        #         # 3x3 neighborhood of next scale
+        #         neighbors_next = dog_next[y-1:y+2, x-1:x+2]
 
-                # 3x3 neighborhood of next scale
-                neighbors_next = dog_next[y-1:y+2, x-1:x+2]
+        #         # Combine neighbors
+        #         neighbors = np.concatenate([
+        #             neighbors_prev.ravel(),
+        #             neighbors_curr.ravel(),
+        #             neighbors_next.ravel()
+        #         ])
 
-                # Combine neighbors
-                neighbors = np.concatenate([
-                    neighbors_prev.ravel(),
-                    neighbors_curr.ravel(),
-                    neighbors_next.ravel()
-                ])
+        #         # remove current center
+        #         center_index = 9 + 4
+        #         neighbors = np.delete(neighbors, center_index)
 
-                # remove current center
-                center_index = 9 + 4
-                neighbors = np.delete(neighbors, center_index)
+        #         # Check extremum
+        #         if value > neighbors.max() or value < neighbors.min():
 
-                # Check extremum
-                if value > neighbors.max() or value < neighbors.min():
+        #             if is_edge_like(scale_space[s], x, y):
+        #                 continue
 
-                    if is_edge_like(scale_space[s], x, y):
-                        continue
+        #             keypoints.append((x, y, s, value))
+        
+        # Compute maxima and minima over 3 scales
+        volume = dog_space[s-1:s+2]
 
-                    keypoints.append((x, y, s, value))
+        local_max = maximum_filter(volume, size=(3, 3, 3))
+        local_min = minimum_filter(volume, size=(3, 3, 3))
+
+        # Current scale from which we want to extract the extrema
+        current_dog = volume[1]
+
+        # Extract extrema
+        max_mask = current_dog == local_max[1]
+        min_mask = current_dog == local_min[1]
+
+        # Only get extrema from strong responses
+        threshold_mask = np.abs(current_dog) >= threshold
+
+        extrema = (max_mask | min_mask) & threshold_mask
+
+        candidate_coords = np.argwhere(extrema)
+        
+        # Compute edge mask for the current scale
+        edge_mask = compute_edge_mask(scale_space[s])
+
+        # Keep only extrema that are not edge-like
+        valid_extrema = extrema & ~edge_mask
+
+        # Exclude image borders
+        valid_extrema[0, :] = False
+        valid_extrema[-1, :] = False
+        valid_extrema[:, 0] = False
+        valid_extrema[:, -1] = False
+
+        # Get coordinates of valid extrema
+        candidate_coords = np.argwhere(valid_extrema)
+
+        # Extract coordinates
+        ys = candidate_coords[:, 0]
+        xs = candidate_coords[:, 1]
+
+        # Extract DoG values
+        values = current_dog[ys, xs]
+
+        # Create keypoints
+        new_keypoints = [
+            (int(x), int(y), int(s), float(value))
+            for x, y, value in zip(xs, ys, values)
+        ]
+
+        keypoints.extend(new_keypoints)
 
     return keypoints
 
@@ -416,10 +488,16 @@ def compute_descriptors(sift_keypoints, magnitudes, orientations):
 
 def compute_corner_descriptors(img):
     # 1. Compute relevant keypoints
+    start = time.perf_counter()
     scale_space, dogs = get_dogs(img)
+    print("Gaussian pyramid:", time.perf_counter() - start)
+
+    start = time.perf_counter()
     keypoints = find_scale_space_extrema(scale_space, dogs)
+    print("Extrema detection:", time.perf_counter() - start)
 
     # 2. Compute orientation
+    start = time.perf_counter()
     # Compute magnitudes and gradients for each scale space
     magnitudes = []
     orientations = []
@@ -429,9 +507,12 @@ def compute_corner_descriptors(img):
         magnitudes.append(magnitude)
         orientations.append(orientation)
     sift_keypoints = assign_orientation(keypoints, scale_space, magnitudes, orientations)
+    print("Orientation assignment:", time.perf_counter() - start)
 
     # 3. Compute feature descriptors
+    start = time.perf_counter()
     sift_keypoints = compute_descriptors(sift_keypoints, magnitudes, orientations)
+    print("Descriptor computation:", time.perf_counter() - start)
 
     return sift_keypoints
 

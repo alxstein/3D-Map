@@ -53,6 +53,16 @@ def process_video(video_path, output_path):
     previous_frame = None
     previous_keypoints = None
 
+    # Store the track color for each keypoint in the previous frame.
+    previous_track_colors = {}
+
+    # Generate a new random color for a new track.
+    def generate_track_color():
+        return tuple(
+            int(value)
+            for value in np.random.randint(80, 256, size=3)
+        )
+
     # Determine which source frames correspond to the target frame rate.
     frame_interval = original_fps / FRAME_RATE
     next_target_frame = 0
@@ -113,37 +123,70 @@ def process_video(video_path, output_path):
             )
 
             # Draw only the inlier correspondences.
-            if inliers:
-                cv_matches = [
-                    cv2.DMatch(
-                        _queryIdx=match["idx_A"],
-                        _trainIdx=match["idx_B"],
-                        _distance=0.0
-                    )
-                    for match in inliers
-                ]
+            # Convert both grayscale frames to BGR for colored visualization.
+            frame_A = cv2.cvtColor(previous_frame, cv2.COLOR_GRAY2BGR)
+            frame_B = cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2BGR)
 
-                visualization = cv2.drawMatches(
-                    img1=previous_frame,
-                    keypoints1=[
-                        cv2.KeyPoint(float(kp["x"]), float(kp["y"]), 1)
-                        for kp in previous_keypoints
-                    ],
-                    img2=gray_frame,
-                    keypoints2=[
-                        cv2.KeyPoint(float(kp["x"]), float(kp["y"]), 1)
-                        for kp in current_keypoints
-                    ],
-                    matches1to2=cv_matches,
-                    outImg=None,
-                    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+            # Create a canvas containing both frames side by side.
+            visualization = cv2.hconcat([frame_A, frame_B])
+
+            # Store the colors of the tracks that continue into the current frame.
+            current_track_colors = {}
+
+            # Draw only the inlier correspondences.
+            for match in inliers:
+
+                idx_A = match["idx_A"]
+                idx_B = match["idx_B"]
+
+                # Reuse the previous color if this keypoint belongs to an existing track.
+                if idx_A in previous_track_colors:
+                    color = previous_track_colors[idx_A]
+                else:
+                    # Assign a new color if this is a newly detected track.
+                    color = generate_track_color()
+
+                # Transfer the track color to the corresponding keypoint in the current frame.
+                current_track_colors[idx_B] = color
+
+                # Get the coordinates of both matched keypoints.
+                x_A = int(previous_keypoints[idx_A]["x"])
+                y_A = int(previous_keypoints[idx_A]["y"])
+
+                x_B = int(current_keypoints[idx_B]["x"])
+                y_B = int(current_keypoints[idx_B]["y"])
+
+                # Shift the second point because the second frame is on the right.
+                x_B_shifted = x_B + NEW_WIDTH
+
+                # Draw the connecting line.
+                cv2.line(
+                    visualization,
+                    (x_A, y_A),
+                    (x_B_shifted, y_B),
+                    color,
+                    1
                 )
-            else:
-                # Show both frames side by side if no valid model was found.
-                visualization = cv2.hconcat([
-                    previous_frame,
-                    gray_frame
-                ])
+
+                # Draw the matched points.
+                cv2.circle(
+                    visualization,
+                    (x_A, y_A),
+                    4,
+                    color,
+                    -1
+                )
+
+                cv2.circle(
+                    visualization,
+                    (x_B_shifted, y_B),
+                    4,
+                    color,
+                    -1
+                )
+
+            # Only tracks matched in this frame are carried forward.
+            previous_track_colors = current_track_colors
 
             # Write the visualization to the output video.
             writer.write(visualization)
@@ -224,9 +267,11 @@ def ransac_matching(keypoints_A, keypoints_B, matches):
         samples_A, samples_B = random_8_matches(points_A, points_B)
 
         # Now compute the model to describe the scenery, the fundamental matrix
-        F = estimate_fundamental_matrix(samples_A, samples_B)
+        try:
+            F = estimate_fundamental_matrix(samples_A, samples_B)
 
-        if F is None:
+        except (ValueError, np.linalg.LinAlgError):
+            # If 8 points have been selected that are extremely close to each other, the algorithm breaks and throws an error
             continue
 
         # Measure how good the model fits all matched points
